@@ -1,0 +1,10 @@
+@echo off
+echo ==========================================
+echo   Starte Altbau-KI Designer...
+echo ==========================================
+cd /d %~dp0
+:: Bibliotheken installieren (falls noch nicht vorhanden)
+pip install -r requirements.txt
+:: App starten
+streamlit run app.py
+pause

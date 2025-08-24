@@ -1,0 +1,472 @@
+# app.py
+import os, json, datetime, textwrap, base64
+from typing import List, Dict, Any, Optional
+import streamlit as st
+from pydantic import BaseModel, Field, validator
+
+# ---------- Konfiguration ----------
+APP_NAME = "Altbau KI-Designer"
+DEFAULT_MODEL_OPENAI = "gpt-4o-mini"     # ändere nach Wunsch
+DEFAULT_MODEL_OLLAMA = "llama3.1"        # lokal verfügbar halten
+SUPPORTED_STYLES = ["Modern", "Skandinavisch", "Industrial", "Minimalistisch", "Klassisch", "Mid-Century", "Landhaus"]
+ENERGY_TARGETS = ["EnEV/GEG-konform", "KfW-Effizienzhaus 70", "KfW-Effizienzhaus 55", "Passivhaus-orientiert", "Nur optische Sanierung"]
+
+# ---------- Datenmodelle ----------
+class Room(BaseModel):
+    name: str
+    area_m2: float = Field(gt=0, description="Grundfläche")
+    features: List[str] = []
+    keep_elements: List[str] = []
+    issues: List[str] = []
+
+class ProjectSpec(BaseModel):
+    building_year: int = Field(..., description="Baujahr")
+    gross_area_m2: float = Field(..., gt=0)
+    rooms: List[Room]
+    style: str
+    palette: Optional[str] = None
+    budget_eur: Optional[float] = Field(None, gt=0)
+    energy_target: str
+    location_region: str = "DE"
+    constraints: List[str] = []
+    must_haves: List[str] = []
+    nice_to_haves: List[str] = []
+    uploaded_plans: List[str] = []  # Dateinamen/IDs
+
+    @validator("style")
+    def style_known(cls, v):
+        if v not in SUPPORTED_STYLES:
+            raise ValueError(f"Stil '{v}' nicht unterstützt. Erlaubt: {', '.join(SUPPORTED_STYLES)}")
+        return v
+
+# ---------- Hilfsfunktionen ----------
+def make_prompt(spec: ProjectSpec) -> str:
+    """Erzeuge einen präzisen System-/User-Prompt für ein strukturiertes, validierbares JSON-Design."""
+    today = datetime.date.today().isoformat()
+    base = f"""
+Du bist ein erfahrener Architekt + Innenarchitekt + Energieberater mit Fokus Altbau-Sanierung in Deutschland (GEG/KfW).
+Datum: {today}
+
+AUFGABE:
+Erstelle eine VOLLSTÄNDIGE, STRUKTURIERTE Sanierungs- und Design-Spezifikation für das folgende Projekt. Antworte AUSSCHLIESSLICH als valides JSON nach dem untenstehenden Schema. Keine Fließtexte außerhalb des JSON.
+
+ANFORDERUNGEN:
+- Erhalte die Altbau-Qualitäten (z.B. Stuck, Parkett, Kassettentüren), sichere Substanz.
+- Liefere je Raum: funktionales Layout, Materialliste (Boden/Wand/Decke/Einbauten), Farbkonzept, Beleuchtungsplan (indirekt/akzent/allgemein), Elektro/Heizkörper, Schallschutz, Smarthome-Optionen.
+- Bauliche Maßnahmen: Grundriss-Anpassungen (wenn sinnvoll), statische Hinweise (hochlevel), Feuchte-/Schimmelprophylaxe, Trittschall, Brandschutz-Basics.
+- Energie: Dämmung (Dach, Fassade innen/außen — Altbauverträglich), Fenster (U-Wert), Heizung (Wärmepumpe/Hybrid/Gas-Bestand), Lüftung (Zuluft/Abluft/WRG).
+- Kostenspannen (€/m²) mit Low/Realistic/High, Phasen-Zeitplan, Risiken+Mitigation, Genehmigungen/Anzeige/Denkmalschutz (falls relevant).
+- Generiere zusätzlich pro Raum 2–3 präzise Bildprompts (textuell) für spätere Renderings.
+- Beziehe Budget und Constraints in die Priorisierung ein.
+
+GELIEFERTES PROJEKT:
+{spec.json(indent=2, ensure_ascii=False)}
+
+AUSGABE-SCHEMA (EXAKT EINHALTEN):
+{{
+  "project_summary": {{
+    "design_intent": "string",
+    "style": "string",
+    "palette": "string",
+    "key_decisions": ["string", "..."]
+  }},
+  "rooms": [
+    {{
+      "name": "string",
+      "target_layout": "string",
+      "materials": {{
+        "floor": "string",
+        "walls": "string",
+        "ceiling": "string",
+        "built_ins": ["string"]
+      }},
+      "color_scheme": ["string"],
+      "lighting_plan": {{
+        "ambient": "string",
+        "task": "string",
+        "accent": "string"
+      }},
+      "mep": {{
+        "electrical": ["string"],
+        "heating": "string",
+        "ventilation": "string",
+        "acoustic": ["string"]
+      }},
+      "risks": ["string"],
+      "image_prompts": ["string", "string"]
+    }}
+  ],
+  "envelope_energy": {{
+    "windows": "string",
+    "insulation": ["string"],
+    "heating_system": "string",
+    "ventilation": "string"
+  }},
+  "costs": {{
+    "eur_per_m2": {{
+      "low": 0,
+      "realistic": 0,
+      "high": 0
+    }},
+    "exclusions": ["string"]
+  }},
+  "timeline": [
+    {{"phase": "Bestand aufnehmen", "weeks": 0}},
+    {{"phase": "Entwurf + Genehmigung", "weeks": 0}},
+    {{"phase": "Ausführung", "weeks": 0}}
+  ],
+  "permits": ["string"],
+  "risks_global": ["string"],
+  "prioritization": ["string"]
+}}
+    """.strip()
+    return base
+
+def rough_cost_estimate(area_m2: float, energy_target: str) -> Dict[str, float]:
+    # sehr grobe Bandbreite (Deutschland, 2025, Altbau; nur Orientierung)
+    base = 900  # €/m2 kosmetisch
+    if "KfW" in energy_target or "Passiv" in energy_target:
+        base = 1500
+    elif "GEG" in energy_target:
+        base = 1200
+    low = int(base * 0.85)
+    realistic = int(base * 1.0)
+    high = int(base * 1.35)
+    return {"low": low, "realistic": realistic, "high": high}
+
+def dollars_to_markdown_download_button(filename: str, content: str, label: str):
+    b64 = base64.b64encode(content.encode()).decode()
+    st.download_button(label=label, data=content.encode(), file_name=filename, mime="text/markdown")
+
+# ---------- KI-Backends ----------
+def call_openai(prompt: str, model: str) -> Optional[str]:
+    """Erwartet OPENAI_API_KEY in der Umgebung. Liefert reinen Text (JSON-String) oder None."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role":"system","content":"Du antwortest ausschließlich mit validem JSON ohne Kommentare."},
+                {"role":"user","content":prompt}
+            ],
+            temperature=0.2,
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        st.warning(f"OpenAI-Fehler: {e}")
+        return None
+
+def call_ollama(prompt: str, model: str) -> Optional[str]:
+    """Erwartet lokale Ollama-API auf http://localhost:11434. Liefert JSON-String oder None."""
+    try:
+        import requests
+        r = requests.post("http://localhost:11434/api/generate", json={"model": model, "prompt": prompt, "stream": False})
+        if r.status_code == 200:
+            data = r.json()
+            return data.get("response", None)
+        else:
+            st.warning(f"Ollama HTTP {r.status_code}: {r.text[:200]}")
+            return None
+    except Exception as e:
+        st.warning(f"Ollama-Fehler: {e}")
+        return None
+
+def call_mock(prompt: str) -> str:
+    """Fallback ohne KI – liefert synthetisches, aber sinnvolles JSON basierend auf Heuristiken."""
+    try:
+        # Minimaler JSON-Stub mit ein paar schlauen Defaults
+        return json.dumps({
+            "project_summary": {
+                "design_intent": "Altbau behutsam modernisieren, Substanz erhalten, Komfort & Effizienz steigern.",
+                "style": "Modern",
+                "palette": "Warme Weißtöne, Grau, Eiche natur, Messing-Akzente",
+                "key_decisions": [
+                    "Bestandsparkett erhalten und aufarbeiten",
+                    "Innenwanddämmung nur an Nordfassade; Feuchtemanagement beachten",
+                    "Wärmepumpe mit Heizkörpern mit größerer Fläche (Niedertemperatur)"
+                ]
+            },
+            "rooms": [
+                {
+                    "name": "Wohnzimmer",
+                    "target_layout": "Offene Sitzgruppe zur Fensterfront, Medienwand mit Akustikpaneelen.",
+                    "materials": {
+                        "floor": "Bestandsparkett geschliffen, geölt",
+                        "walls": "Silikatfarbe diffusionsoffen",
+                        "ceiling": "Feinspachtel, Stuckleisten erhalten",
+                        "built_ins": ["Lowboard Maßanfertigung Eiche"]
+                    },
+                    "color_scheme": ["RAL 9016", "Eiche natur", "Graphit"],
+                    "lighting_plan": {
+                        "ambient": "LED-Lichtvoute umlaufend",
+                        "task": "Stehleuchte Lesebereich",
+                        "accent": "Spots auf Kunst & Nischen"
+                    },
+                    "mep": {
+                        "electrical": ["Neue Stromkreise, CAT7-Dose, dimmbare Kreise"],
+                        "heating": "Bestandsheizkörper gegen Niedertemperatur-Modelle tauschen",
+                        "ventilation": "Dezentrale WRG-Lüfter",
+                        "acoustic": ["Textilien, Akustikpaneele Rückwand"]
+                    },
+                    "risks": ["Unebene Böden", "Leitungen im Putz"],
+                    "image_prompts": [
+                        "cozy modern living room in renovated european prewar apartment, oak herringbone, indirect cove lighting, large gray windows, brass accents, minimal decor, photorealistic",
+                        "industrial-minimal fusion living room, textured plaster walls, low profile sofa, gallery lighting, evening ambience"
+                    ]
+                }
+            ],
+            "envelope_energy": {
+                "windows": "3-fach Verglasung, U_w ≈ 0.9–1.1 W/m²K, graue Alu-Optik",
+                "insulation": ["Dach: 180–240mm Mineralwolle", "Innenwanddämmung 40–80mm Kalziumsilikat diffusionsoffen"],
+                "heating_system": "Monoblock-Wärmepumpe, ggf. Hybrid mit Bestand",
+                "ventilation": "Dezentrale WRG-Einheiten in Feuchträumen & Wohnräumen"
+            },
+            "costs": {
+                "eur_per_m2": {"low": 1200, "realistic": 1500, "high": 2000},
+                "exclusions": ["Küche & Möbel", "Planerhonorare", "Genehmigungsgebühren"]
+            },
+            "timeline": [
+                {"phase":"Bestand aufnehmen","weeks":3},
+                {"phase":"Entwurf + Genehmigung","weeks":8},
+                {"phase":"Ausführung","weeks":20}
+            ],
+            "permits": ["Baugenehmigung bei tragenden Änderungen", "Denkmalschutz prüfen", "Statik-Nachweis"],
+            "risks_global": ["Feuchte in Außenwänden", "Asbest/PAK im Altbau möglich"],
+            "prioritization": [
+                "Hülle & Haustechnik zuerst (Energie, Feuchte, Elektrik)",
+                "Danach Grundriss & Oberflächen",
+                "Zum Schluss Einbauten & Beleuchtung feinjustieren"
+            ]
+        }, ensure_ascii=False)
+    except Exception:
+        # Letzter Notnagel: minimales valides JSON
+        return '{"project_summary":{"design_intent":"fallback"},"rooms":[],"envelope_energy":{},"costs":{"eur_per_m2":{"low":1000,"realistic":1200,"high":1600}},"timeline":[],"permits":[],"risks_global":[],"prioritization":[]}'
+
+def route_llm(backend: str, prompt: str, model_openai: str, model_ollama: str) -> str:
+    if backend == "OpenAI":
+        out = call_openai(prompt, model_openai)
+        if out: return out
+    elif backend == "Ollama (lokal)":
+        out = call_ollama(prompt, model_ollama)
+        if out: return out
+    # Fallback
+    return call_mock(prompt)
+
+# ---------- UI ----------
+st.set_page_config(page_title=APP_NAME, layout="wide")
+st.title("🏗️ Altbau KI-Designer")
+st.caption("Entwurf • Maßnahmen • Energie • Kosten • Zeitplan • Risiken • Export")
+
+with st.sidebar:
+    st.header("Projekt")
+    colA, colB = st.columns(2)
+    with colA:
+        building_year = st.number_input("Baujahr", min_value=1850, max_value=2025, value=1972, step=1)
+    with colB:
+        area = st.number_input("Gesamtfläche (m²)", min_value=20.0, max_value=2000.0, value=140.0, step=1.0)
+
+    style = st.selectbox("Stil", SUPPORTED_STYLES, index=0)
+    palette = st.text_input("Palette (optional)", "Warme Weißtöne, Grau, Eiche, Messing")
+    budget = st.number_input("Budget (EUR, optional)", min_value=0, value=0, step=1000)
+    energy_target = st.selectbox("Energie-Ziel", ENERGY_TARGETS, index=1)
+    location_region = st.selectbox("Region", ["DE", "AT", "CH", "EU"], index=0)
+
+    constraints = st.text_area("Restriktionen (z.B. Denkmalschutz, niedrige Decken, Feuchtezonen)", "")
+    must_haves = st.text_area("Must-Haves (z.B. offene Küche, Walk-in Closet)", "")
+    nice_to_haves = st.text_area("Nice-to-Haves", "")
+
+    st.divider()
+    st.subheader("Räume")
+    default_rooms = [
+        {"name":"Flur", "area_m2":10.0, "features":[]},
+        {"name":"Küche", "area_m2":14.0, "features":["Kochinsel"]},
+        {"name":"Esszimmer", "area_m2":16.0, "features":[]},
+        {"name":"Wohnzimmer", "area_m2":28.0, "features":["große Fensterfront"]},
+        {"name":"Bad", "area_m2":10.0, "features":["Walk-in Dusche"]},
+        {"name":"Schlafzimmer", "area_m2":15.0, "features":["Ankleide in Nische"]},
+        {"name":"Gäste-WC", "area_m2":3.0, "features":[]},
+    ]
+    room_json = st.text_area("Räume als JSON-Liste bearbeiten",
+                             json.dumps(default_rooms, indent=2, ensure_ascii=False))
+    uploads = st.file_uploader("Grundriss/Fotos (optional)", accept_multiple_files=True,
+                               type=["png","jpg","jpeg","pdf","webp"])
+
+    st.divider()
+    st.subheader("KI-Backend")
+    backend = st.selectbox("Provider", ["OpenAI", "Ollama (lokal)", "Mock (ohne API)"], index=2)
+    model_openai = st.text_input("OpenAI Model", DEFAULT_MODEL_OPENAI)
+    model_ollama = st.text_input("Ollama Model", DEFAULT_MODEL_OLLAMA)
+    temperature = st.slider("Kreativität (Temperatur, nur Info)", 0.0, 1.0, 0.2, 0.05)
+
+# Build spec
+try:
+    rooms_input = json.loads(room_json)
+    rooms = [Room(**r) for r in rooms_input]
+except Exception as e:
+    st.error(f"Fehler in der Räume-JSON: {e}")
+    st.stop()
+
+constraints_list = [s.strip() for s in constraints.split("\n") if s.strip()]
+must_list = [s.strip() for s in must_haves.split("\n") if s.strip()]
+nice_list = [s.strip() for s in nice_to_haves.split("\n") if s.strip()]
+uploaded_names = [f.name for f in uploads] if uploads else []
+
+spec = ProjectSpec(
+    building_year=int(building_year),
+    gross_area_m2=float(area),
+    rooms=rooms,
+    style=style,
+    palette=palette or None,
+    budget_eur=(float(budget) if budget>0 else None),
+    energy_target=energy_target,
+    location_region=location_region,
+    constraints=constraints_list,
+    must_haves=must_list,
+    nice_to_haves=nice_list,
+    uploaded_plans=uploaded_names
+)
+
+st.success("Projektspezifikation erfasst.")
+
+# Prompt & KI
+with st.expander("🔧 Prompt (Transparenz)"):
+    st.code(make_prompt(spec), language="markdown")
+
+col1, col2 = st.columns([1,1])
+with col1:
+    if st.button("🚀 Design generieren", type="primary"):
+        prompt = make_prompt(spec)
+        raw = route_llm(backend, prompt, model_openai, model_ollama)
+        st.session_state["raw_json"] = raw
+        st.toast("Designvorschlag erzeugt.", icon="✅")
+
+with col2:
+    if "raw_json" in st.session_state:
+        st.download_button("📥 Roh-JSON herunterladen", data=st.session_state["raw_json"].encode("utf-8"),
+                           file_name="altbau_design_raw.json", mime="application/json")
+
+st.divider()
+
+# Anzeige & Post-Processing
+if "raw_json" in st.session_state:
+    raw = st.session_state["raw_json"]
+    try:
+        data = json.loads(raw)
+    except Exception:
+        st.warning("Antwort war kein valides JSON. Versuche, es zu säubern.")
+        # Minimal säubern
+        raw_fixed = raw.strip().split("```")[-1].replace("json","").strip()
+        try:
+            data = json.loads(raw_fixed)
+        except Exception as e:
+            st.error(f"Konnte JSON nicht parsen: {e}")
+            st.stop()
+
+    # Fallback-Kosten wenn leer
+    if "costs" not in data or "eur_per_m2" not in data["costs"]:
+        data.setdefault("costs", {})["eur_per_m2"] = rough_cost_estimate(spec.gross_area_m2, spec.energy_target)
+
+    st.subheader("📐 Zusammenfassung")
+    ps = data.get("project_summary", {})
+    st.write(f"**Design-Intention:** {ps.get('design_intent','–')}")
+    st.write(f"**Stil:** {ps.get('style','–')}  |  **Palette:** {ps.get('palette','–')}")
+    if ps.get("key_decisions"):
+        st.markdown("- **Schlüsselentscheidungen:**")
+        for k in ps["key_decisions"]:
+            st.markdown(f"  - {k}")
+
+    st.subheader("🧩 Räume (Auszug)")
+    for r in data.get("rooms", []):
+        with st.container(border=True):
+            st.markdown(f"### {r.get('name','Raum')}")
+            st.markdown(f"**Layout:** {r.get('target_layout','–')}")
+            mats = r.get("materials", {})
+            st.markdown(f"- Boden: {mats.get('floor','–')}")
+            st.markdown(f"- Wände: {mats.get('walls','–')}")
+            st.markdown(f"- Decke: {mats.get('ceiling','–')}")
+            bi = mats.get("built_ins", [])
+            if bi: st.markdown(f"- Einbauten: {', '.join(bi)}")
+            st.markdown(f"**Farben:** {', '.join(r.get('color_scheme', [])) or '–'}")
+            lp = r.get("lighting_plan", {})
+            st.markdown(f"**Licht:** Ambient: {lp.get('ambient','–')} • Task: {lp.get('task','–')} • Akzent: {lp.get('accent','–')}")
+            mep = r.get("mep", {})
+            st.markdown(f"**Technik:** Heizung: {mep.get('heating','–')} • Lüftung: {mep.get('ventilation','–')}")
+            if r.get("risks"):
+                st.markdown(f"**Raum-Risiken:** {', '.join(r['risks'])}")
+            if r.get("image_prompts"):
+                with st.expander("🎨 Bild-Prompts für spätere Renderings"):
+                    for ip in r["image_prompts"]:
+                        st.code(ip)
+
+    st.subheader("🏠 Hülle & Energie")
+    env = data.get("envelope_energy", {})
+    st.markdown(f"- **Fenster:** {env.get('windows','–')}")
+    ins = env.get("insulation", [])
+    if ins:
+        st.markdown(f"- **Dämmung:** " + "; ".join(ins))
+    st.markdown(f"- **Heizung:** {env.get('heating_system','–')}")
+    st.markdown(f"- **Lüftung:** {env.get('ventilation','–')}")
+
+    st.subheader("💶 Kosten (Richtwerte)")
+    c = data.get("costs", {}).get("eur_per_m2", rough_cost_estimate(spec.gross_area_m2, spec.energy_target))
+    st.markdown(f"- **€/m²:** Low ~ {c['low']} | Realistisch ~ {c['realistic']} | High ~ {c['high']}")
+    if spec.gross_area_m2:
+        st.markdown(f"- **Projektumfang (realistisch):** ~ {int(c['realistic'] * spec.gross_area_m2):,} €".replace(",", "."))
+
+    st.subheader("🗓️ Zeitplan")
+    for t in data.get("timeline", []):
+        st.markdown(f"- {t.get('phase','?')}: ~{t.get('weeks',0)} Wochen")
+
+    st.subheader("📜 Genehmigungen & Pflichten")
+    for p in data.get("permits", []):
+        st.markdown(f"- {p}")
+
+    st.subheader("⚠️ Risiken & Prioritäten")
+    for r in data.get("risks_global", []):
+        st.markdown(f"- Risiko: {r}")
+    if data.get("prioritization"):
+        st.markdown("**Priorisierung:**")
+        for p in data["prioritization"]:
+            st.markdown(f"- {p}")
+
+    # Export als Markdown-Dossier
+    dossier = f"# {APP_NAME} – Projektdossier\n\n"
+    dossier += f"**Baujahr:** {spec.building_year}  |  **Fläche:** {spec.gross_area_m2} m²  |  **Stil:** {spec.style}\n\n"
+    dossier += f"## Zusammenfassung\n{ps.get('design_intent','')}\n\n"
+    dossier += "## Räume\n"
+    for r in data.get("rooms", []):
+        dossier += f"### {r.get('name','Raum')}\n"
+        dossier += f"- Layout: {r.get('target_layout','–')}\n"
+        mats = r.get("materials", {})
+        dossier += f"- Materialien: Boden {mats.get('floor','–')}, Wände {mats.get('walls','–')}, Decke {mats.get('ceiling','–')}\n"
+        lp = r.get("lighting_plan", {})
+        dossier += f"- Licht: Ambient {lp.get('ambient','–')}, Task {lp.get('task','–')}, Akzent {lp.get('accent','–')}\n"
+        dossier += f"- Farben: {', '.join(r.get('color_scheme', []))}\n"
+        dossier += "\n"
+    dossier += "## Hülle & Energie\n"
+    dossier += f"- Fenster: {env.get('windows','–')}\n"
+    dossier += f"- Dämmung: {'; '.join(ins) if ins else '–'}\n"
+    dossier += f"- Heizung: {env.get('heating_system','–')}\n"
+    dossier += f"- Lüftung: {env.get('ventilation','–')}\n\n"
+    dossier += "## Kosten\n"
+    dossier += f"- €/m²: low {c['low']} | realistisch {c['realistic']} | high {c['high']}\n"
+    dossier += f"- Projekt (realistisch): ~ {int(c['realistic'] * spec.gross_area_m2):,} €\n\n".replace(",", ".")
+    dossier += "## Zeitplan\n"
+    for t in data.get("timeline", []): dossier += f"- {t.get('phase','?')}: ~{t.get('weeks',0)} Wochen\n"
+    dossier += "\n## Genehmigungen\n" + "\n".join([f"- {p}" for p in data.get("permits", [])]) + "\n"
+    dossier += "\n## Risiken\n" + "\n".join([f"- {r}" for r in data.get("risks_global", [])]) + "\n"
+    dossier += "\n## Priorisierung\n" + "\n".join([f"- {p}" for p in data.get("prioritization", [])]) + "\n"
+
+    st.divider()
+    st.subheader("📤 Export")
+    dollars_to_markdown_download_button("altbau_ki_dossier.md", dossier, "Dossier als Markdown herunterladen")
+
+else:
+    st.info("Fülle links die Projektangaben aus und klicke **Design generieren**.")
+
+# Footer
+st.caption("Hinweis: Kostenschätzungen sind grobe Richtwerte. Vor Umsetzung bitte Fachplanung/Statik/GEG prüfen.")
